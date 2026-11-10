@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>S24 Ultra OLED Plasma Core Wallpaper</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: none;
+        }
+
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000000; /* OLED True Pitch Black */
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+
+        canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            background-color: #000000;
+        }
+
+        /* Hole-punch camera indicator zone visual check (Top 6% safe zone buffer) */
+        #safe-zone-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 6vh;
+            pointer-events: none;
+            z-index: 10;
+        }
+
+        /* Diagnostic / Controls Overlay UI (auto-hides) */
+        #hud {
+            position: absolute;
+            bottom: 24px;
+            left: 20px;
+            right: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            color: rgba(255, 255, 255, 0.4);
+            font-size: 11px;
+            letter-spacing: 0.5px;
+            pointer-events: none;
+            transition: opacity 0.5s ease;
+            z-index: 20;
+            font-family: monospace;
+        }
+
+        .hud-tag {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            padding: 4px 8px;
+            border-radius: 12px;
+            backdrop-filter: blur(8px);
+        }
+
+        .status-dot {
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background-color: #00ffcc;
+            margin-right: 5px;
+            box-shadow: 0 0 8px #00ffcc;
+        }
+
+        .status-dot.idle {
+            background-color: #ffaa00;
+            box-shadow: 0 0 8px #ffaa00;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="safe-zone-overlay"></div>
+    
+    <div id="hud">
+        <div class="hud-tag"><span id="status-dot" class="status-dot"></span><span id="fps-counter">120 FPS</span> | Adreno 750 (DPR 1.5)</div>
+        <div class="hud-tag" id="mode-indicator">MODE: HIGH FREQ (120Hz LTPO)</div>
+    </div>
+
+    <canvas id="glcanvas"></canvas>
+
+    <script>
+        /**
+         * Samsung Galaxy S24 Ultra Optimized WebGL Particle Swarm & Fluid Core
+         * Architecture: Single-file Vanilla WebGL + Zero Garbage Collection Render Loop
+         */
+
+        (function () {
+            'use strict';
+
+            // Device Configuration Constants
+            const MAX_DPR_CAP = 1.5; // Cap viewport scaling to keep Adreno 750 fill rate optimal at 1440x3120
+            const PARTICLE_COUNT = 16000;
+            const IDLE_TIMEOUT_MS = 5000; // Throttle to 30 FPS after 5s idle
+            const CAMERA_SAFE_ZONE_RATIO = 0.08; // Top 8% offset for camera punch-hole avoidance
+
+            // WebGL & DOM Handles
+            const canvas = document.getElementById('glcanvas');
+            let gl = null;
+
+            // DOM Overlay Handles
+            const fpsCounterEl = document.getElementById('fps-counter');
+            const statusDotEl = document.getElementById('status-dot');
+            const modeIndicatorEl = document.getElementById('mode-indicator');
+
+            // Interactive & Physics State Variables
+            let width = 0;
+            let height = 0;
+            let dpr = 1.0;
+            
+            // Interaction Tracking
+            let lastInteractionTime = performance.now();
+            let isIdle = false;
+            let targetFPS = 120;
+            let frameIntervalMs = 1000 / 120;
+
+            // Pointer Tracking Pool (Zero allocation during interaction)
+            const MAX_POINTERS = 4;
+            const pointerData = new Float32Array(MAX_POINTERS * 4); // [x, y, radius, intensity]
+
+            // Parallax / Gyroscope Physics
+            let targetTiltX = 0;
+            let targetTiltY = 0;
+            let currentTiltX = 0;
+            let currentTiltY = 0;
+
+            // Shader Sources
+            const VERTEX_SHADER_SOURCE = `
+                attribute vec3 a_position;
+                attribute vec3 a_velocity;
+                attribute vec4 a_color;
+                attribute float a_size;
+                attribute float a_life;
+
+                uniform vec2 u_resolution;
+                uniform vec2 u_tilt;
+                uniform float u_time;
+                uniform vec4 u_pointers[4]; // [x, y, radius, intensity]
+
+                varying vec4 v_color;
+                varying float v_life;
+
+                void main() {
+                    vec3 pos = a_position;
+
+                    // Parallax depth offset based on Z position
+                    pos.xy += u_tilt * (pos.z * 0.4);
+
+                    // Touch Pointer Interactions
+                    for (int i = 0; i < 4; i++) {
+                        if (u_pointers[i].w > 0.001) {
+                            vec2 pPos = u_pointers[i].xy;
+                            vec2 dir = pos.xy - pPos;
+                            float dist = length(dir);
+                            float radius = u_pointers[i].z;
+                            if (dist < radius && dist > 0.001) {
+                                float force = (1.0 - (dist / radius)) * u_pointers[i].w * 40.0;
+                                vec2 push = normalize(dir) * force;
+                                pos.xy += push;
+                            }
+                        }
+                    }
+
+                    // Convert to Normalized Device Coordinates (NDC)
+                    vec2 zeroToOne = pos.xy / u_resolution;
+                    vec2 zeroToTwo = zeroToOne * 2.0;
+                    vec2 clipSpace = zeroToTwo - 1.0;
+
+                    // WebGL Y axis flips relative to screen pixels
+                    gl_Position = vec4(clipSpace.x, -clipSpace.y, pos.z * 0.001, 1.0);
+
+                    // Dynamic Point Size with Depth Attenuation
+                    float depthScale = (1.0 + pos.z * 0.5);
+                    gl_PointSize = a_size * depthScale * (u_resolution.y / 1000.0);
+
+                    // Pass to fragment shader
+                    v_color = a_color;
+                    v_life = a_life;
+                }
+            `;
+
+            const FRAGMENT_SHADER_SOURCE = `
+                precision highp float;
+
+                varying vec4 v_color;
+                varying float v_life;
+
+                void main() {
+                    // Soft circular particle shape calculation
+                    vec2 coord = gl_PointCoord - vec2(0.5);
+                    float distSquared = dot(coord, coord);
+                    
+                    if (distSquared > 0.25) {
+                        discard; // Optimization: Drop pixels outside circle radius
+                    }
+
+                    // Radial glow gradient attenuation
+                    float alpha = smoothstep(0.5, 0.0, sqrt(distSquared));
+                    alpha = pow(alpha, 1.5) * v_color.a * v_life;
+
+                    gl_FragColor = vec4(v_color.rgb, alpha);
+                }
+            `;
+
+            // Particle System Pre-allocated Typed Array Buffers (Zero GC Overhead)
+            const positionBufferData = new Float32Array(PARTICLE_COUNT * 3);
+            const velocityBufferData = new Float32Array(PARTICLE_COUNT * 3);
+            const colorBufferData = new Float32Array(PARTICLE_COUNT * 4);
+            const sizeBufferData = new Float32Array(PARTICLE_COUNT);
+            const lifeBufferData = new Float32Array(PARTICLE_COUNT);
+
+            // WebGL Attribute Locations & Uniform Handles
+            let program;
+            let positionBuffer, velocityBuffer, colorBuffer, sizeBuffer, lifeBuffer;
+            let uResolutionLoc, uTiltLoc, uTimeLoc, uPointersLoc;
+            let aPosLoc, aVelLoc, aColLoc, aSizeLoc, aLifeLoc;
+
+            /**
+             * Initialize WebGL Context and Resources
+             */
+            function initWebGL() {
+                gl = canvas.getContext('webgl', {
+                    alpha: false,
+                    depth: false,
+                    stencil: false,
+                    antialias: false,
+                    preserveDrawingBuffer: false,
+                    powerPreference: 'high-performance'
+                });
+
+                if (!gl) {
+                    console.error('WebGL context creation failed.');
+                    return false;
+                }
+
+                // Enable Additive Blending for Vivid Neon Plasma Glow on AMOLED
+                gl.enable(gl.BLEND);
+                gl.blendFunc(gl.SRC_ALPHA, gl.ONE); // Pure additive blending
+
+                // Compile Shaders
+                const vertShader = createShader(gl, gl.VERTEX_SHADER, VERTEX_SHADER_SOURCE);
+                const fragShader = createShader(gl, gl.FRAGMENT_SHADER, FRAGMENT_SHADER_SOURCE);
+                
+                program = gl.createProgram();
+                gl.attachShader(program, vertShader);
+                gl.attachShader(program, fragShader);
+                gl.linkProgram(program);
+
+                if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                    console.error('Program link error:', gl.getProgramInfoLog(program));
+                    return false;
+                }
+
+                gl.useProgram(program);
+
+                // Get Attribute and Uniform Locations
+                aPosLoc = gl.getAttribLocation(program, 'a_position');
+                aVelLoc = gl.getAttribLocation(program, 'a_velocity');
+                aColLoc = gl.getAttribLocation(program, 'a_color');
+                aSizeLoc = gl.getAttribLocation(program, 'a_size');
+                aLifeLoc = gl.getAttribLocation(program, 'a_life');
+
+                uResolutionLoc = gl.getUniformLocation(program, 'u_resolution');
+                uTiltLoc = gl.getUniformLocation(program, 'u_tilt');
+                uTimeLoc = gl.getUniformLocation(program, 'u_time');
+                uPointersLoc = gl.getUniformLocation(program, 'u_pointers');
+
+                // Create GPU Buffers
+                positionBuffer = gl.createBuffer();
+                colorBuffer = gl.createBuffer();
+                sizeBuffer = gl.createBuffer();
+                lifeBuffer = gl.createBuffer();
+
+                return true;
+            }
+
+            function createShader(gl, type, source) {
+                const shader = gl.createShader(type);
+                gl.shaderSource(shader, source);
+                gl.compileShader(shader);
+                if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                    console.error('Shader compilation error:', gl.getShaderInfoLog(shader));
+                    gl.deleteShader(shader);
+                    return null;
+                }
+                return shader;
+            }
+
+            /**
+             * Initialize Particle System States (Centered Below Punch Hole)
+             */
+            function initParticles() {
+                const centerY = height * (0.5 + CAMERA_SAFE_ZONE_RATIO * 0.5); // Shift main cluster below top camera hole
+
+                for (let i = 0; i < PARTICLE_COUNT; i++) {
+                    resetParticle(i, true, centerY);
+                }
+
+                // Bind initial state into GPU buffers
+                bindBuffer(positionBuffer, positionBufferData, aPosLoc, 3);
+                bindBuffer(colorBuffer, colorBufferData, aColLoc, 4);
+                bindBuffer(sizeBuffer, sizeBufferData, aSizeLoc, 1);
+                bindBuffer(lifeBuffer, lifeBufferData, aLifeLoc, 1);
+            }
+
+            function resetParticle(i, isInitial, centerYOverride) {
+                const i3 = i * 3;
+                const i4 = i * 4;
+
+                const spawnCenterY = centerYOverride !== undefined ? centerYOverride : height * (0.5 + CAMERA_SAFE_ZONE_RATIO * 0.5);
+                const spawnCenterX = width * 0.5;
+
+                // Radial distribution
+                const angle = Math.random() * Math.PI * 2;
+                const radius = Math.pow(Math.random(), 1.8) * (Math.min(width, height) * 0.45);
+
+                positionBufferData[i3] = spawnCenterX + Math.cos(angle) * radius;
+                positionBufferData[i3 + 1] = spawnCenterY + Math.sin(angle) * radius;
+                positionBufferData[i3 + 2] = (Math.random() - 0.5) * 2.0; // Depth Z (-1 to 1)
+
+                // Dynamic Orbital Velocity
+                const speed = (0.2 + Math.random() * 1.5);
+                velocityBufferData[i3] = -Math.sin(angle) * speed;
+                velocityBufferData[i3 + 1] = Math.cos(angle) * speed;
+                velocityBufferData[i3 + 2] = (Math.random() - 0.5) * 0.05;
+
+                // Vivid S24 Ultra AMOLED Color Palette (Cyan, Magenta, Deep Electric Blue, Amber Accent)
+                const colorPaletteChoice = Math.random();
+                if (colorPaletteChoice < 0.4) {
+                    // Electric Cyan / Neon Teal
+                    colorBufferData[i4] = 0.0;
+                    colorBufferData[i4 + 1] = 0.95;
+                    colorBufferData[i4 + 2] = 1.0;
+                    colorBufferData[i4 + 3] = 0.85;
+                } else if (colorPaletteChoice < 0.75) {
+                    // Deep Violet / Vivid Neon Magenta
+                    colorBufferData[i4] = 0.85;
+                    colorBufferData[i4 + 1] = 0.05;
+                    colorBufferData[i4 + 2] = 1.0;
+                    colorBufferData[i4 + 3] = 0.8;
+                } else if (colorPaletteChoice < 0.92) {
+                    // Cobalt Electric Blue
+                    colorBufferData[i4] = 0.1;
+                    colorBufferData[i4 + 1] = 0.3;
+                    colorBufferData[i4 + 2] = 1.0;
+                    colorBufferData[i4 + 3] = 0.9;
+                } else {
+                    // High-energy Solar Amber Spark
+                    colorBufferData[i4] = 1.0;
+                    colorBufferData[i4 + 1] = 0.6;
+                    colorBufferData[i4 + 2] = 0.0;
+                    colorBufferData[i4 + 3] = 1.0;
+                }
+
+                sizeBufferData[i] = 3.0 + Math.random() * 7.0;
+                lifeBufferData[i] = isInitial ? Math.random() : 1.0;
+            }
+
+            function bindBuffer(buffer, data, attribLoc, size) {
+                gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+                gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
+                gl.enableVertexAttribArray(attribLoc);
+                gl.vertexAttribPointer(attribLoc, size, gl.FLOAT, false, 0, 0);
+            }
+
+            /**
+             * Resize Handler with Hardware DPR Capping
+             */
+            function handleResize() {
+                // Device Pixel Ratio capping for Snapdragon 8 Gen 3 Adreno GPU optimization
+                dpr = Math.min(window.devicePixelRatio || 1.0, MAX_DPR_CAP);
+                width = Math.floor(window.innerWidth * dpr);
+                height = Math.floor(window.innerHeight * dpr);
+
+                canvas.width = width;
+                canvas.height = height;
+
+                if (gl) {
+                    gl.viewport(0, 0, width, height);
+                    gl.uniform2f(uResolutionLoc, width, height);
+                }
+            }
+
+            /**
+             * Touch & Pointer Interaction Handler
+             */
+            function setupInteractivity() {
+                function updatePointers(e) {
+                    registerUserInteraction();
+
+                    // Clear active pointers intensity
+                    for (let p = 0; p < MAX_POINTERS; p++) {
+                        pointerData[p * 4 + 3] = 0.0;
+                    }
+
+                    if (e.touches) {
+                        for (let i = 0; i < Math.min(e.touches.length, MAX_POINTERS); i++) {
+                            const touch = e.touches[i];
+                            const idx = i * 4;
+                            pointerData[idx] = touch.clientX * dpr;
+                            pointerData[idx + 1] = touch.clientY * dpr;
+                            pointerData[idx + 2] = 160.0 * dpr; // Radius
+                            pointerData[idx + 3] = 1.0;   // Active intensity
+                        }
+                    } else if (e.clientX !== undefined) {
+                        pointerData[0] = e.clientX * dpr;
+                        pointerData[1] = e.clientY * dpr;
+                        pointerData[2] = 180.0 * dpr;
+                        pointerData[3] = 1.0;
+                    }
+                }
+
+                function clearPointers() {
+                    for (let p = 0; p < MAX_POINTERS; p++) {
+                        pointerData[p * 4 + 3] = 0.0;
+                    }
+                }
+
+                window.addEventListener('pointermove', updatePointers, { passive: true });
+                window.addEventListener('pointerdown', updatePointers, { passive: true });
+                window.addEventListener('pointerup', clearPointers, { passive: true });
+                window.addEventListener('touchstart', updatePointers, { passive: true });
+                window.addEventListener('touchmove', updatePointers, { passive: true });
+                window.addEventListener('touchend', clearPointers, { passive: true });
+
+                // Gyroscope / Accelerometer Parallax Depth Handler
+                window.addEventListener('deviceorientation', (e) => {
+                    if (e.gamma !== null && e.beta !== null) {
+                        registerUserInteraction();
+                        // Smoothly bound device tilt (-30 to +30 deg mapping)
+                        targetTiltX = Math.max(-1.0, Math.min(1.0, e.gamma / 30.0)) * 25.0 * dpr;
+                        targetTiltY = Math.max(-1.0, Math.min(1.0, e.beta / 30.0)) * 25.0 * dpr;
+                    }
+                }, { passive: true });
+            }
+
+            /**
+             * Heartbeat & Idle Throttle Controller
+             */
+            function registerUserInteraction() {
+                lastInteractionTime = performance.now();
+                if (isIdle) {
+                    isIdle = false;
+                    targetFPS = 120; // Resume smooth 120Hz LTPO rendering
+                    frameIntervalMs = 1000 / 120;
+                    statusDotEl.classList.remove('idle');
+                    modeIndicatorEl.innerText = "MODE: HIGH FREQ (120Hz LTPO)";
+                }
+            }
+
+            /**
+             * Main Zero-GC WebGL Render Loop
+             */
+            let lastFrameTime = performance.now();
+            let frameCount = 0;
+            let fpsTimer = performance.now();
+
+            function render(currentTime) {
+                requestAnimationFrame(render);
+
+                // Idle Power Throttle Check (5 seconds non-interaction)
+                const elapsedSinceInteraction = currentTime - lastInteractionTime;
+                if (!isIdle && elapsedSinceInteraction > IDLE_TIMEOUT_MS) {
+                    isIdle = true;
+                    targetFPS = 30; // Throttle to 30 FPS to save power & protect thermals
+                    frameIntervalMs = 1000 / 30;
+                    statusDotEl.classList.add('idle');
+                    modeIndicatorEl.innerText = "MODE: POWER SAVER (30Hz Idle)";
+                }
+
+                // Delta-time rendering throttle gate
+                const delta = currentTime - lastFrameTime;
+                if (delta < frameIntervalMs - 0.5) {
+                    return; // Skip rendering frame to maintain targeted refresh rate
+                }
+
+                lastFrameTime = currentTime - (delta % frameIntervalMs);
+
+                // Calculate Real-time FPS for diagnostic readout
+                frameCount++;
+                if (currentTime - fpsTimer >= 1000) {
+                    fpsCounterEl.innerText = `${Math.round((frameCount * 1000) / (currentTime - fpsTimer))} FPS`;
+                    frameCount = 0;
+                    fpsTimer = currentTime;
+                }
+
+                // Smooth Inertial Tilt Gyro Physics
+                currentTiltX += (targetTiltX - currentTiltX) * 0.05;
+                currentTiltY += (targetTiltY - currentTiltY) * 0.05;
+
+                // Physics Simulation Cycle
+                const centerTargetX = width * 0.5;
+                const centerTargetY = height * (0.5 + CAMERA_SAFE_ZONE_RATIO * 0.5);
+
+                for (let i = 0; i < PARTICLE_COUNT; i++) {
+                    const i3 = i * 3;
+
+                    // Lifecycle updates
+                    lifeBufferData[i] -= 0.003;
+                    if (lifeBufferData[i] <= 0) {
+                        resetParticle(i, false, centerTargetY);
+                        continue;
+                    }
+
+                    // Orbital Swirling Gravitational Physics toward safe-zone center
+                    const px = positionBufferData[i3];
+                    const py = positionBufferData[i3 + 1];
+
+                    const dx = centerTargetX - px;
+                    const dy = centerTargetY - py;
+                    const dist = Math.sqrt(dx * dx + dy * dy) + 0.001;
+
+                    // Vortex force vectors
+                    const force = 0.08 / (dist * 0.01 + 1.0);
+                    const swirlX = -dy / dist;
+                    const swirlY = dx / dist;
+
+                    velocityBufferData[i3] += (swirlX * force * 1.5 + (dx / dist) * 0.02);
+                    velocityBufferData[i3 + 1] += (swirlY * force * 1.5 + (dy / dist) * 0.02);
+
+                    // Velocity damping / friction
+                    velocityBufferData[i3] *= 0.985;
+                    velocityBufferData[i3 + 1] *= 0.985;
+
+                    // Position Integration
+                    positionBufferData[i3] += velocityBufferData[i3];
+                    positionBufferData[i3 + 1] += velocityBufferData[i3 + 1];
+                }
+
+                // Update GPU Attribute Buffers
+                gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+                gl.bufferSubData(gl.ARRAY_BUFFER, 0, positionBufferData);
+
+                gl.bindBuffer(gl.ARRAY_BUFFER, lifeBuffer);
+                gl.bufferSubData(gl.ARRAY_BUFFER, 0, lifeBufferData);
+
+                // Pass Uniforms
+                gl.uniform2f(uTiltLoc, currentTiltX, currentTiltY);
+                gl.uniform1f(uTimeLoc, currentTime * 0.001);
+                gl.uniform4fv(uPointersLoc, pointerData);
+
+                // OLED True Pitch Black Canvas Clear
+                gl.clearColor(0.0, 0.0, 0.0, 1.0);
+                gl.clear(gl.COLOR_BUFFER_BIT);
+
+                // Draw Particle System
+                gl.drawArrays(gl.POINTS, 0, PARTICLE_COUNT);
+            }
+
+            /**
+             * App Initialization Entry Point
+             */
+            window.addEventListener('load', () => {
+                handleResize();
+                window.addEventListener('resize', handleResize, { passive: true });
+
+                if (initWebGL()) {
+                    initParticles();
+                    setupInteractivity();
+                    requestAnimationFrame(render);
+                }
+            });
+
+        })();
+    </script>
+</body>
+</html>
